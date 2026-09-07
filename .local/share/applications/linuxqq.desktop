@@ -1,6 +1,6 @@
 [Desktop Entry]
 Name=QQ
-Exec=env DESKTOPINTEGRATION=false /usr/bin/linuxqq --no-sandbox --ozone-platform-hint=auto --enable-wayland-ime %U
+Exec=env DESKTOPINTEGRATION=false XMODIFIERS=@im=fcitx /usr/bin/linuxqq --no-sandbox --ozone-platform=wayland --enable-wayland-ime --disable-vulkan %U
 Terminal=false
 Type=Application
 Icon=/usr/share/icons/linuxqq.png

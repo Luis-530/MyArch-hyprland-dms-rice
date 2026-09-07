@@ -68,6 +68,7 @@ end)
 hl.env("XCURSOR_SIZE", "48")        -- physical px now that xwayland:force_zero_scaling is on (was 24 @ scale 2)
 hl.env("HYPRCURSOR_SIZE", "24")
 hl.env("GDK_SCALE", "2")            -- scale XWayland GTK apps; safe for Wayland-native GTK
+hl.env("GTK_THEME", "Adwaita:dark") -- force GTK apps such as Nemo to use the dark variant
 
 
 -----------------------
@@ -210,7 +211,7 @@ hl.config({
         -- See https://wiki.hypr.land/Configuring/Layouts/Scrolling-Layout/
         fullscreen_on_one_column = true,   -- a lone column fills the whole screen
         column_width             = 0.5,    -- default column width, [0.1 - 1.0]
-        focus_fit_method         = 0,      -- 0 = center focused column (niri default), 1 = fit
+        focus_fit_method         = 1,      -- 0 = center focused column, 1 = fit into view (only scroll if needed)
         follow_focus             = true,   -- scroll the focused column into view
         follow_min_visible       = 0.4,    -- min fraction visible before auto-scroll kicks in
         explicit_column_widths   = "0.333, 0.5, 0.667, 1.0",  -- colresize +conf cycle
@@ -308,6 +309,54 @@ hl.device({
 
 local mainMod = "SUPER" -- Sets "Windows" key as main modifier
 
+-- ---------------------------------------------------------------------------
+-- Super-alone launcher guard.
+--
+-- Hyprland's keybind manager (0.56 rewrite) fires a release bind on EVERY
+-- key-up of its trigger. "SUPER + super_l" with { release = true } therefore
+-- ALSO fires when Super is released after a Super+key chord — e.g. Super+T
+-- opens a terminal and then the launcher pops up too. Top-level "mods-only"
+-- binds (bind = SUPER, ...) no longer exist and catchall binds are submap-only,
+-- so there is no built-in "Super pressed alone" anymore. Workaround:
+--
+--   * every other SUPER bind marks the Super press as "used" when it fires
+--     (hl.bind is wrapped below, so this is automatic for every bind after
+--     this point),
+--   * the Super release bind only toggles the launcher if no other bind ran
+--     while Super was held.
+--
+-- Verified against src/keybinds/Manager.cpp + Bind.cpp @575191109: a sided
+-- modifier key (super_l) doesn't count toward chordSize(), so the release bind
+-- is neither armed nor subchord-suppressed, and matchesContext() ORs the
+-- trigger's modifier into the release modmask — it inevitably matches on
+-- every Super key-up.
+-- ---------------------------------------------------------------------------
+local superChordSeen = false
+
+local nativeBind = hl.bind
+hl.bind = function(keys, dispatcher, opts)
+    -- The release bind below (and any future release bind) stays raw.
+    if opts and opts.release then
+        return nativeBind(keys, dispatcher, opts)
+    end
+    if type(keys) == "string" and keys:find("SUPER", 1, true) then
+        local wrapped
+        if type(dispatcher) == "function" then
+            wrapped = function()
+                superChordSeen = true
+                return dispatcher()
+            end
+        else
+            wrapped = function()
+                superChordSeen = true
+                hl.dispatch(dispatcher)
+            end
+        end
+        return nativeBind(keys, wrapped, opts)
+    end
+    return nativeBind(keys, dispatcher, opts)
+end
+
 
 -- ==================
 -- Application Launchers
@@ -321,10 +370,15 @@ local closeWindowBind = hl.bind(mainMod .. " + Q", hl.dsp.window.close())
 hl.bind(mainMod .. " + M",     hl.dsp.exit())
 hl.bind(mainMod .. " + space", hl.dsp.exec_cmd("dms ipc call spotlight toggle"))
 -- Super alone (press and release) opens the dms app launcher / start menu.
--- Binds the Super key's keysym (super_l) as a release bind, so it fires on
--- key-up. See the chord caveat in chat: a release bind may also fire after
--- Super+key combos in some Hyprland versions — test Super+T release.
-hl.bind(mainMod .. " + super_l", hl.dsp.exec_cmd("dms ipc call launcher toggle"), { release = true })
+-- Release bind on the Super key's keysym. The callback checks superChordSeen
+-- (set by any other SUPER bind that fired while Super was held — see the
+-- guard above) so Super+key chords don't also open the launcher.
+hl.bind(mainMod .. " + super_l", function()
+    if not superChordSeen then
+        hl.exec_cmd("dms ipc call launcher toggle")
+    end
+    superChordSeen = false
+end, { release = true })
 hl.bind(mainMod .. " + V",     hl.dsp.exec_cmd("dms ipc call clipboard toggle"))
 hl.bind(mainMod .. " + comma", hl.dsp.exec_cmd("dms ipc call settings focusOrToggle"))
 hl.bind(mainMod .. " + N",     hl.dsp.exec_cmd("dms ipc call notifications toggle"))
@@ -457,11 +511,95 @@ hl.bind("SUPER + SHIFT + S",       hl.dsp.window.move({ workspace = "special:mag
 -- ==================
 -- Scrolling layout — column operations (niri-like)
 -- ==================
--- Repurposed from dwindle `preselect` (a no-op under scrolling) → swap the
--- focused column with its left/right neighbor. To restore preselect under
--- dwindle/master, change these back to "preselect l" / "preselect r".
-hl.bind(mainMod .. " + bracketleft",  hl.dsp.layout("swapcol l"))
-hl.bind(mainMod .. " + bracketright", hl.dsp.layout("swapcol r"))
+-- Move the focused window left/right, with "consume-or-expel" behavior:
+--   - If the focused window is alone in its column, append it to the adjacent
+--     column in the key's direction (consume).
+--   - If it shares the column with other windows, split it into its own column
+--     (expel). For the left key, promote creates the column to the right, so we
+--     swap it left with "swapcol l"; for the right key, promote is already in
+--     the correct direction.
+hl.bind(mainMod .. " + bracketleft", function()
+    local COLUMN_X_TOLERANCE = 8
+    local alone = true
+
+    local ok, win = pcall(hl.get_active_window)
+    if ok and win and win.at then
+        local winX
+        if type(win.at) == "table" then
+            winX = win.at[1] or win.at.x
+        else
+            winX = win.at
+        end
+        if type(winX) == "number" and win.workspace then
+            local ok2, wins = pcall(hl.get_workspace_windows, win.workspace)
+            if ok2 and wins then
+                local count = 0
+                for _, w in pairs(wins) do
+                    if w and not w.floating and w.fullscreen == 0 and w.visible then
+                        local otherX
+                        if type(w.at) == "table" then
+                            otherX = w.at[1] or w.at.x
+                        else
+                            otherX = w.at
+                        end
+                        if type(otherX) == "number" and math.abs(otherX - winX) <= COLUMN_X_TOLERANCE then
+                            count = count + 1
+                        end
+                    end
+                end
+                alone = count <= 1
+            end
+        end
+    end
+
+    if alone then
+        hl.dispatch(hl.dsp.window.move({ direction = "left" }))
+    else
+        hl.dispatch(hl.dsp.layout("promote"))
+        hl.dispatch(hl.dsp.layout("swapcol l"))
+    end
+end)
+
+hl.bind(mainMod .. " + bracketright", function()
+    local COLUMN_X_TOLERANCE = 8
+    local alone = true
+
+    local ok, win = pcall(hl.get_active_window)
+    if ok and win and win.at then
+        local winX
+        if type(win.at) == "table" then
+            winX = win.at[1] or win.at.x
+        else
+            winX = win.at
+        end
+        if type(winX) == "number" and win.workspace then
+            local ok2, wins = pcall(hl.get_workspace_windows, win.workspace)
+            if ok2 and wins then
+                local count = 0
+                for _, w in pairs(wins) do
+                    if w and not w.floating and w.fullscreen == 0 and w.visible then
+                        local otherX
+                        if type(w.at) == "table" then
+                            otherX = w.at[1] or w.at.x
+                        else
+                            otherX = w.at
+                        end
+                        if type(otherX) == "number" and math.abs(otherX - winX) <= COLUMN_X_TOLERANCE then
+                            count = count + 1
+                        end
+                    end
+                end
+                alone = count <= 1
+            end
+        end
+    end
+
+    if alone then
+        hl.dispatch(hl.dsp.window.move({ direction = "right" }))
+    else
+        hl.dispatch(hl.dsp.layout("promote"))
+    end
+end)
 
 -- Scroll the strip left/right by one whole column. (SUPER+H/L already moves
 -- focus and auto-scrolls via follow_focus; these move the view independently.)
@@ -548,4 +686,3 @@ hl.window_rule({
     move  = "20 monitor_h-120",
     float = true,
 })
-

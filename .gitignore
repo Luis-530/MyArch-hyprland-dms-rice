@@ -2,3 +2,22 @@
 !.gitignore
 !.bashrc
 !.zshrc
+!tty1_hypr.sh
+
+# 允许 config 树
+!.config/
+!.config/nvim/
+!.config/nvim/**
+!.config/kitty/
+!.config/kitty/**
+!.config/hypr/
+!.config/hypr/**
+!.config/environment.d/
+!.config/environment.d/**
+
+# wayland下缩放配置及fcitx5支持
+!.local/
+!.local/share/
+!.local/share/applications/
+!.local/share/applications/**
+#!.config/nvim/init.lua
